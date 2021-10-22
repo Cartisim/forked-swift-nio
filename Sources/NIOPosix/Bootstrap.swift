@@ -766,10 +766,24 @@ public final class ClientBootstrap: NIOClientTCPBootstrapProtocol {
 /// ```
 ///
 /// The `DatagramChannel` will operate on `AddressedEnvelope<ByteBuffer>` as inbound and outbound messages.
-public final class DatagramBootstrap {
+public final class DatagramBootstrap: NIODatagramUDPBootstrapProtocol {
 
+    private var protocolHandlers: Optional<() -> [ChannelHandler]>
     private let group: EventLoopGroup
-    private var channelInitializer: Optional<ChannelInitializerCallback>
+    private var connectTimeout: TimeAmount = TimeAmount.seconds(10)
+//    private var channelInitializer: Optional<ChannelInitializerCallback>
+    private var _channelInitializer: ChannelInitializerCallback
+    private var channelInitializer: ChannelInitializerCallback {
+        if let protocolHandlers = self.protocolHandlers {
+            return { channel in
+                self._channelInitializer(channel).flatMap {
+                    channel.pipeline.addHandlers(protocolHandlers(), position: .first)
+                }
+            }
+        } else {
+            return self._channelInitializer
+        }
+    }
     @usableFromInline
     internal var _channelOptions: ChannelOptions.Storage
 
@@ -800,7 +814,9 @@ public final class DatagramBootstrap {
         }
         self._channelOptions = ChannelOptions.Storage()
         self.group = group
-        self.channelInitializer = nil
+//        self.channelInitializer = nil
+        self._channelInitializer = { channel in channel.eventLoop.makeSucceededFuture(()) }
+        self.protocolHandlers = nil
     }
 
     /// Initialize the bound `DatagramChannel` with `initializer`. The most common task in initializer is to add
@@ -809,7 +825,19 @@ public final class DatagramBootstrap {
     /// - parameters:
     ///     - handler: A closure that initializes the provided `Channel`.
     public func channelInitializer(_ handler: @escaping (Channel) -> EventLoopFuture<Void>) -> Self {
-        self.channelInitializer = handler
+        self._channelInitializer = handler
+        return self
+    }
+    
+    /// Sets the protocol handlers that will be added to the front of the `ChannelPipeline` right after the
+    /// `channelInitializer` has been called.
+    ///
+    /// Per bootstrap, you can only set the `protocolHandlers` once. Typically, `protocolHandlers` are used for the TLS
+    /// implementation. Most notably, `NIOClientTCPBootstrap`, NIO's "universal bootstrap" abstraction, uses
+    /// `protocolHandlers` to add the required `ChannelHandler`s for many TLS implementations.
+    public func protocolHandlers(_ handlers: @escaping () -> [ChannelHandler]) -> Self {
+        precondition(self.protocolHandlers == nil, "protocol handlers can only be set once")
+        self.protocolHandlers = handlers
         return self
     }
 
@@ -850,6 +878,15 @@ public final class DatagramBootstrap {
         }
     }
 
+    /// Specifies a timeout to apply to a connection attempt.
+    ///
+    /// - parameters:
+    ///     - timeout: The timeout that will apply to the connection attempt.
+    public func connectTimeout(_ timeout: TimeAmount) -> Self {
+        self.connectTimeout = timeout
+        return self
+    }
+    
     /// Bind the `DatagramChannel` to `host` and `port`.
     ///
     /// - parameters:
@@ -916,7 +953,8 @@ public final class DatagramBootstrap {
 
     private func bind0(makeChannel: (_ eventLoop: SelectableEventLoop) throws -> DatagramChannel, _ registerAndBind: @escaping (EventLoop, DatagramChannel) -> EventLoopFuture<Void>) -> EventLoopFuture<Channel> {
         let eventLoop = self.group.next()
-        let channelInitializer = self.channelInitializer ?? { _ in eventLoop.makeSucceededFuture(()) }
+//        let channelInitializer = self.channelInitializer ?? { _ in eventLoop.makeSucceededFuture(()) }
+        let channelInitializer = self.channelInitializer 
         let channelOptions = self._channelOptions
 
         let channel: DatagramChannel
