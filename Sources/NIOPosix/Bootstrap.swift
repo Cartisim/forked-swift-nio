@@ -766,7 +766,7 @@ public final class ClientBootstrap: NIOClientTCPBootstrapProtocol {
 /// ```
 ///
 /// The `DatagramChannel` will operate on `AddressedEnvelope<ByteBuffer>` as inbound and outbound messages.
-public final class DatagramBootstrap: NIODatagramUDPBootstrapProtocol {
+public final class DatagramBootstrap: NIOClientTCPBootstrapProtocol {
 
     private var protocolHandlers: Optional<() -> [ChannelHandler]>
     private let group: EventLoopGroup
@@ -897,6 +897,13 @@ public final class DatagramBootstrap: NIODatagramUDPBootstrapProtocol {
             return try SocketAddress.makeAddressResolvingHost(host, port: port)
         }
     }
+    
+    //TODO: - Fix: Really not what we want to do, but changing the name will break the api
+    public func connect(host: String, port: Int) -> EventLoopFuture<Channel> {
+        return bind0 {
+            return try SocketAddress.makeAddressResolvingHost(host, port: port)
+        }
+    }
 
     /// Bind the `DatagramChannel` to `address`.
     ///
@@ -905,12 +912,24 @@ public final class DatagramBootstrap: NIODatagramUDPBootstrapProtocol {
     public func bind(to address: SocketAddress) -> EventLoopFuture<Channel> {
         return bind0 { address }
     }
+    
+    //TODO: - Fix: Really not what we want to do, but changing the name will break the api
+    public func connect(to address: SocketAddress) -> EventLoopFuture<Channel> {
+        return bind0 { address }
+    }
 
     /// Bind the `DatagramChannel` to a UNIX Domain Socket.
     ///
     /// - parameters:
     ///     - unixDomainSocketPath: The path of the UNIX Domain Socket to bind on. `path` must not exist, it will be created by the system.
     public func bind(unixDomainSocketPath: String) -> EventLoopFuture<Channel> {
+        return bind0 {
+            return try SocketAddress(unixDomainSocketPath: unixDomainSocketPath)
+        }
+    }
+    
+    //TODO: - Fix: Really not what we want to do, but changing the name will break the api
+    public func connect(unixDomainSocketPath: String) -> EventLoopFuture<Channel> {
         return bind0 {
             return try SocketAddress(unixDomainSocketPath: unixDomainSocketPath)
         }

@@ -139,6 +139,9 @@ public protocol NIOClientTCPBootstrapProtocol {
 ///             .enableTLS()
 ///             .connect(host: "example.com", port: 443)
 ///             .wait()
+///
+public typealias NIOClientBootstrap = NIOClientTCPBootstrap
+
 public struct NIOClientTCPBootstrap {
     public let underlyingBootstrap: NIOClientTCPBootstrapProtocol
     private let tlsEnablerTypeErased: (NIOClientTCPBootstrapProtocol) -> NIOClientTCPBootstrapProtocol
