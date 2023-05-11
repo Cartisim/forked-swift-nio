@@ -975,6 +975,7 @@ private extension Channel {
 ///
 /// The connected `SocketChannel` will operate on `ByteBuffer` as inbound and on `IOData` as outbound messages.
 public final class ClientBootstrap: NIOClientTCPBootstrapProtocol {
+    
     private let group: EventLoopGroup
     #if swift(>=5.7)
     private var protocolHandlers: Optional<@Sendable () -> [ChannelHandler]>
@@ -1250,6 +1251,7 @@ public final class ClientBootstrap: NIOClientTCPBootstrapProtocol {
             return self.group.next().makeFailedFuture(error)
         }
     }
+    
 
     #if !os(Windows)
         /// Use the existing connected socket file descriptor.
@@ -1841,3 +1843,95 @@ public final class NIOPipeBootstrap {
 
 @available(*, unavailable)
 extension NIOPipeBootstrap: Sendable {}
+
+extension ClientBootstrap: Sendable {
+    private typealias Register = (EventLoop, SocketChannel) -> EventLoopFuture<Void>
+    
+    @available(macOS 10.15, iOS 13, tvOS 13, watchOS 6, *)
+    @_spi(AsyncChannel)
+    public func connectAsync<ChannelInboundIn: Sendable, ChannelOutboundOut: Sendable>(
+        host: String,
+        port: Int,
+        backpressureStrategy: NIOAsyncSequenceProducerBackPressureStrategies.HighLowWatermark? = nil
+    ) async throws -> NIOAsyncChannel<ChannelInboundIn, ChannelOutboundOut> {
+
+        let loop = self.group.next()
+        let resolver = self.resolver ?? GetaddrinfoResolver(loop: loop,
+                                                            aiSocktype: .stream,
+                                                            aiProtocol: .tcp)
+        let connector = AsyncHappyEyeballsConnector<ChannelInboundIn, ChannelOutboundOut>(resolver: resolver,
+                                               loop: loop,
+                                               host: host,
+                                               port: port,
+                                               connectTimeout: self.connectTimeout) { eventLoop, protocolFamily in
+            let future: EventLoopFuture<NIOAsyncChannel<ChannelInboundIn, ChannelOutboundOut>> = self.irnc(eventLoop, protocolFamily: protocolFamily)
+            let result = future.map { asyncChannel in
+                let promise = eventLoop.makePromise(of: Channel.self)
+                promise.succeed(asyncChannel.channel)
+            }
+               result.whenSuccess { future in
+                    return future
+            }
+            return future
+        }
+        return try await connector.resolveAndConnect().get()
+    }
+    
+    @available(macOS 10.15, iOS 13, tvOS 13, watchOS 6, *)
+    func irnc<ChannelInboundIn: Sendable, ChannelOutboundOut: Sendable>(_ eventLoop: EventLoop, protocolFamily: NIOBSDSocket.ProtocolFamily) -> EventLoopFuture<NIOAsyncChannel<ChannelInboundIn, ChannelOutboundOut>> {
+        let promise = eventLoop.makePromise(of: NIOAsyncChannel<ChannelInboundIn, ChannelOutboundOut>.self)
+        promise.completeWithTask {
+            return try await self.initializeAndRegisterNewChannel(eventLoop: eventLoop, protocolFamily: protocolFamily, backpressureStrategy: nil) {
+                $1.eventLoop.makeSucceededFuture(())
+            }
+        }
+        return promise.futureResult
+    }
+    
+    @available(macOS 10.15, iOS 13, tvOS 13, watchOS 6, *)
+    private func initializeAndRegisterNewChannel<ChannelInboundIn: Sendable, ChannelOutboundOut: Sendable>
+    (
+                                                 eventLoop: EventLoop,
+                                                 protocolFamily: NIOBSDSocket.ProtocolFamily,
+                                                 backpressureStrategy: NIOAsyncSequenceProducerBackPressureStrategies.HighLowWatermark?,
+                                                 register: @escaping Register
+    )
+                                                 async throws -> NIOAsyncChannel<ChannelInboundIn, ChannelOutboundOut> {
+
+        let clientChannelOptions = self._channelOptions
+        let channelInitializer = self._channelInitializer
+                                                     
+        func makeChannel(eventLoop: SelectableEventLoop,
+                               protocolFamily: NIOBSDSocket.ProtocolFamily) throws -> SocketChannel {
+            return try SocketChannel(eventLoop: eventLoop, protocolFamily: protocolFamily, enableMPTCP: self.enableMPTCP)
+        }
+
+        let channel = try makeChannel(eventLoop: eventLoop as! SelectableEventLoop, protocolFamily: protocolFamily)
+        return try await eventLoop.submit {
+            clientChannelOptions.applyAllChannelOptions(to: channel).flatMap {
+                if let bindTarget = self.bindTarget {
+                    return channel.bind(to: bindTarget).flatMap {
+                        channelInitializer(channel)
+                    }
+                } else {
+                    return channelInitializer(channel)
+                }
+        }.flatMap {
+            do {
+                let asyncChannel = try NIOAsyncChannel<ChannelInboundIn, ChannelOutboundOut>(
+                    synchronouslyWrapping: channel,
+                    backpressureStrategy: backpressureStrategy
+                )
+                return register(eventLoop, channel).map { asyncChannel }
+            } catch {
+                return eventLoop.makeFailedFuture(error)
+            }
+        }.flatMapError { error in
+           channel.close0(error: error, mode: .all, promise: nil)
+            return eventLoop.makeFailedFuture(error)
+        }
+    }.flatMap {
+        $0
+    }.get()
+    }
+}

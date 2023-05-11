@@ -72,6 +72,7 @@ private final class ByteBufferToByteHandler: ChannelInboundHandler {
     }
 }
 
+@available(macOS 10.15, iOS 13, tvOS 13, watchOS 6, *)
 final class AsyncChannelBootstrapTests: XCTestCase {
     enum NegotiationResult {
         case string(NIOAsyncChannel<String, String>)
@@ -390,7 +391,7 @@ final class AsyncChannelBootstrapTests: XCTestCase {
     }
 
     // MARK: - Test Helpers
-
+    @available(macOS 10.15, iOS 13, tvOS 13, watchOS 6, *)
     private func makeClientChannel(eventLoopGroup: EventLoopGroup, port: Int) async throws -> Channel {
         return try await ClientBootstrap(group: eventLoopGroup)
             .channelInitializer { channel in
@@ -438,6 +439,7 @@ final class AsyncChannelBootstrapTests: XCTestCase {
         )
     }
 
+    @available(macOS 10.15, iOS 13, tvOS 13, watchOS 6, *)
     @discardableResult
     private func addTypedApplicationProtocolNegotiationHandler(to channel: Channel) throws -> EventLoopFuture<NIOProtocolNegotiationResult<NegotiationResult>> {
         let negotiationHandler = NIOTypedApplicationProtocolNegotiationHandler<NegotiationResult>(eventLoop: channel.eventLoop) { alpnResult, channel in
@@ -482,6 +484,7 @@ final class AsyncChannelBootstrapTests: XCTestCase {
     }
 }
 
+@available(macOS 10.15, iOS 13, tvOS 13, watchOS 6, *)
 extension AsyncStream {
     fileprivate static func makeStream(
         of elementType: Element.Type = Element.self,

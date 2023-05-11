@@ -12,7 +12,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-import NIOCore
+@_spi(AsyncChannel) import NIOCore
 
 // This module implements Happy Eyeballs 2 (RFC 8305). A few notes should be made about the design.
 //
@@ -571,6 +571,518 @@ internal class HappyEyeballsConnector {
             self.error.connectionErrors.append(SingleConnectionFailure(target: target, error: error))
             self.pendingConnections.remove(element: channelFuture)
             self.processInput(.connectFailed)
+        }
+    }
+
+    // Cleans up all internal state, ensuring that there are no reference cycles and allowing
+    // everything to eventually be deallocated.
+    private func cleanUp() {
+        assert(self.state == .complete, "Clean up in invalid state \(self.state)")
+
+        if dnsResolutions < 2 {
+            resolver.cancelQueries()
+        }
+
+        if let resolutionTask = self.resolutionTask {
+            resolutionTask.cancel()
+            self.resolutionTask = nil
+        }
+
+        if let connectionTask = self.connectionTask {
+            connectionTask.cancel()
+            self.connectionTask = nil
+        }
+
+        if let timeoutTask = self.timeoutTask {
+            timeoutTask.cancel()
+            self.timeoutTask = nil
+        }
+
+        let connections = self.pendingConnections
+        self.pendingConnections = []
+        for connection in connections {
+            connection.whenSuccess { channel in channel.close(promise: nil) }
+        }
+    }
+
+    /// A future callback that fires when a DNS A lookup completes.
+    private func whenALookupComplete(future: EventLoopFuture<[SocketAddress]>) {
+        future.map { results in
+            self.targets.aResultsAvailable(results)
+        }.recover { err in
+            self.error.dnsAError = err
+        }.whenComplete { (_: Result<Void, Error>) in
+            self.dnsResolutions += 1
+            self.processInput(.resolverACompleted)
+        }
+    }
+
+    /// A future callback that fires when a DNS AAAA lookup completes.
+    private func whenAAAALookupComplete(future: EventLoopFuture<[SocketAddress]>) {
+        future.map { results in
+            self.targets.aaaaResultsAvailable(results)
+        }.recover { err in
+            self.error.dnsAAAAError = err
+        }.whenComplete { (_: Result<Void, Error>) in
+            // It's possible that we were waiting to time out here, so if we were we should
+            // cancel that.
+            self.resolutionTask?.cancel()
+            self.resolutionTask = nil
+
+            self.dnsResolutions += 1
+
+            self.processInput(.resolverAAAACompleted)
+        }
+    }
+
+    /// A future callback that fires when the resolution delay completes.
+    private func resolutionDelayComplete() {
+        resolutionTask = nil
+        processInput(.resolutionDelayElapsed)
+    }
+}
+
+
+@available(macOS 10.15, iOS 13, tvOS 13, watchOS 6, *)
+internal class AsyncHappyEyeballsConnector<ChannelInboundIn, ChannelOutboundOut> {
+    
+    /// An enum for keeping track of connection state.
+    private enum ConnectionState {
+        /// Initial state. No work outstanding.
+        case idle
+
+        /// All name queries are currently outstanding.
+        case resolving
+
+        /// The A query has resolved, but the AAAA query is outstanding and the
+        /// resolution delay has not yet elapsed.
+        case aResolvedWaiting
+
+        /// The A query has resolved and the resolution delay has elapsed. We can
+        /// begin connecting immediately, but should not give up if we run out of
+        /// targets until the AAAA result returns.
+        case aResolvedConnecting
+
+        /// The AAAA query has resolved. We can begin connecting immediately, but
+        /// should not give up if we run out of targets until the AAAA result returns.
+        case aaaaResolved
+
+        /// All DNS results are in. We can make connection attempts until we run out
+        /// of targets.
+        case allResolved
+
+        /// The connection attempt is complete.
+        case complete
+    }
+
+    /// An enum of inputs for the connector state machine.
+    private enum ConnectorInput {
+        /// Begin DNS resolution.
+        case resolve
+
+        /// The A record lookup completed.
+        case resolverACompleted
+
+        /// The AAAA record lookup completed.
+        case resolverAAAACompleted
+
+        /// The delay between the A result and the AAAA result has elapsed.
+        case resolutionDelayElapsed
+
+        /// The delay between starting one connection and the next has elapsed.
+        case connectDelayElapsed
+
+        /// The overall connect timeout has elapsed.
+        case connectTimeoutElapsed
+
+        /// A connection attempt has succeeded.
+        case connectSuccess
+
+        /// A connection attempt has failed.
+        case connectFailed
+
+        /// There are no connect targets remaining: all have been connected to and
+        /// failed.
+        case noTargetsRemaining
+    }
+
+    /// The DNS resolver provided by the user.
+    private let resolver: Resolver
+
+    /// The event loop this connector will run on.
+    private let loop: EventLoop
+
+    /// The host name we're connecting to.
+    private let host: String
+
+    /// The port we're connecting to.
+    private let port: Int
+
+    /// A callback, provided by the user, that is used to build a channel.
+    ///
+    /// This callback is expected to build *and register* a channel with the event loop that
+    /// was used with this resolver. It is free to set up the channel asynchronously, but note
+    /// that the time taken to set the channel up will be counted against the connection delay,
+    /// meaning that long channel setup times may cause more connections to be outstanding
+    /// than intended.
+    ///
+    /// The channel builder callback takes an event loop and a protocol family as arguments.
+    private let channelBuilderCallback: (EventLoop, NIOBSDSocket.ProtocolFamily) throws -> EventLoopFuture<NIOAsyncChannel<ChannelInboundIn, ChannelOutboundOut>>
+
+    /// The amount of time to wait for an AAAA response to come in after a A response is
+    /// received. By default this is 50ms.
+    private let resolutionDelay: TimeAmount
+
+    /// A reference to the task that will execute after the resolution delay expires, if
+    /// one is scheduled. This is held to ensure that we can cancel this task if the AAAA
+    /// response comes in before the resolution delay expires.
+    private var resolutionTask: Optional<Scheduled<Void>>
+
+    /// The amount of time to wait for a connection to succeed before beginning a new connection
+    /// attempt. By default this is 250ms.
+    private let connectionDelay: TimeAmount
+
+    /// A reference to the task that will execute after the connection delay expires, if one
+    /// is scheduled. This is held to ensure that we can cancel this task if a connection
+    /// succeeds before the connection delay expires.
+    private var connectionTask: Optional<Scheduled<Void>>
+
+    /// The amount of time to allow for the overall connection process before timing it out.
+    private let connectTimeout: TimeAmount
+
+    /// A reference to the task that will time us out.
+    private var timeoutTask: Optional<Scheduled<Void>>
+
+    /// The promise that will hold the final connected channel.
+    private let resolutionPromise: EventLoopPromise<NIOAsyncChannel<ChannelInboundIn, ChannelOutboundOut>>
+    /// Our state machine state.
+    private var state: ConnectionState
+
+    /// Our iterator of resolved targets. This keeps track of what targets are left to have
+    /// connection attempts made to them, and emits them in the appropriate order as needed.
+    private var targets: TargetIterator = TargetIterator()
+
+    /// An array of futures of channels that are currently attempting to connect.
+    ///
+    /// This is kept to ensure that we can clean up after ourselves once a connection succeeds,
+    /// and throw away all pending connection attempts that are no longer needed.
+    private var pendingConnections: [EventLoopFuture<Channel>] = []
+
+    /// The number of DNS resolutions that have returned.
+    ///
+    /// This is used to keep track of whether we need to cancel the outstanding resolutions
+    /// during cleanup.
+    private var dnsResolutions: Int = 0
+
+    /// An object that holds any errors we encountered.
+    private var error: NIOConnectionError
+
+    init(resolver: Resolver,
+         loop: EventLoop,
+         host: String,
+         port: Int,
+         connectTimeout: TimeAmount,
+         resolutionDelay: TimeAmount = .milliseconds(50),
+         connectionDelay: TimeAmount = .milliseconds(250),
+         channelBuilderCallback: @escaping (EventLoop, NIOBSDSocket.ProtocolFamily) throws -> EventLoopFuture<NIOAsyncChannel<ChannelInboundIn, ChannelOutboundOut>>
+    ) {
+        self.resolver = resolver
+        self.loop = loop
+        self.host = host
+        self.port = port
+        self.connectTimeout = connectTimeout
+        self.channelBuilderCallback = channelBuilderCallback
+        self.resolutionTask = nil
+        self.connectionTask = nil
+        self.timeoutTask = nil
+
+        self.state = .idle
+        self.resolutionPromise = self.loop.makePromise()
+        self.error = NIOConnectionError(host: host, port: port)
+
+        precondition(resolutionDelay.nanoseconds > 0, "Resolution delay must be greater than zero, got \(resolutionDelay).")
+        self.resolutionDelay = resolutionDelay
+
+        precondition(connectionDelay >= .milliseconds(100) && connectionDelay <= .milliseconds(2000), "Connection delay must be between 100 and 2000 ms, got \(connectionDelay)")
+        self.connectionDelay = connectionDelay
+    }
+
+    /// Initiate a DNS resolution attempt using Happy Eyeballs 2.
+    ///
+    /// returns: An `EventLoopFuture` that fires with a connected `Channel`.
+    public func resolveAndConnect() -> EventLoopFuture<NIOAsyncChannel<ChannelInboundIn, ChannelOutboundOut>> {
+        // We dispatch ourselves onto the event loop, rather than do all the rest of our processing from outside it.
+        self.loop.execute {
+            self.timeoutTask = self.loop.scheduleTask(in: self.connectTimeout) { self.processInput(.connectTimeoutElapsed) }
+            self.processInput(.resolve)
+        }
+        return resolutionPromise.futureResult
+    }
+
+    /// Spin the state machine.
+    ///
+    /// - parameters:
+    ///     - input: The input to the state machine.
+    private func processInput(_ input: ConnectorInput) {
+        switch (state, input) {
+        // Only one valid transition from idle: to start resolving.
+        case (.idle, .resolve):
+            state = .resolving
+            beginDNSResolution()
+
+        // In the resolving state, we can exit three ways: either the A query returns,
+        // the AAAA does, or the overall connect timeout fires.
+        case (.resolving, .resolverACompleted):
+            state = .aResolvedWaiting
+            beginResolutionDelay()
+        case (.resolving, .resolverAAAACompleted):
+            state = .aaaaResolved
+            beginConnecting()
+        case (.resolving, .connectTimeoutElapsed):
+            state = .complete
+            timedOut()
+
+        // In the aResolvedWaiting state, we can exit three ways: the AAAA query returns,
+        // the resolution delay elapses, or the overall connect timeout fires.
+        case (.aResolvedWaiting, .resolverAAAACompleted):
+            state = .allResolved
+            beginConnecting()
+        case (.aResolvedWaiting, .resolutionDelayElapsed):
+            state = .aResolvedConnecting
+            beginConnecting()
+        case (.aResolvedWaiting, .connectTimeoutElapsed):
+            state = .complete
+            timedOut()
+
+        // In the aResolvedConnecting state, a number of inputs are valid: the AAAA result can
+        // return, the connectionDelay can elapse, the overall connection timeout can fire,
+        // a connection can succeed, a connection can fail, and we can run out of targets.
+        case (.aResolvedConnecting, .resolverAAAACompleted):
+            state = .allResolved
+            connectToNewTargets()
+        case (.aResolvedConnecting, .connectDelayElapsed):
+            connectionDelayElapsed()
+        case (.aResolvedConnecting, .connectTimeoutElapsed):
+            state = .complete
+            timedOut()
+        case (.aResolvedConnecting, .connectSuccess):
+            state = .complete
+            connectSuccess()
+        case (.aResolvedConnecting, .connectFailed):
+            connectFailed()
+        case (.aResolvedConnecting, .noTargetsRemaining):
+            // We are still waiting for the AAAA query, so we
+            // do nothing.
+            break
+
+        // In the aaaaResolved state, a number of inputs are valid: the A result can return,
+        // the connectionDelay can elapse, the overall connection timeout can fire, a connection
+        // can succeed, a connection can fail, and we can run out of targets.
+        case (.aaaaResolved, .resolverACompleted):
+            state = .allResolved
+            connectToNewTargets()
+        case (.aaaaResolved, .connectDelayElapsed):
+            connectionDelayElapsed()
+        case (.aaaaResolved, .connectTimeoutElapsed):
+            state = .complete
+            timedOut()
+        case (.aaaaResolved, .connectSuccess):
+            state = .complete
+            connectSuccess()
+        case (.aaaaResolved, .connectFailed):
+            connectFailed()
+        case (.aaaaResolved, .noTargetsRemaining):
+            // We are still waiting for the A query, so we
+            // do nothing.
+            break
+
+        // In the allResolved state, a number of inputs are valid: the connectionDelay can elapse,
+        // the overall connection timeout can fire, a connection can succeed, a connection can fail,
+        // and possibly we can run out of targets.
+        case (.allResolved, .connectDelayElapsed):
+            connectionDelayElapsed()
+        case (.allResolved, .connectTimeoutElapsed):
+            state = .complete
+            timedOut()
+        case (.allResolved, .connectSuccess):
+            state = .complete
+            connectSuccess()
+        case (.allResolved, .connectFailed):
+            connectFailed()
+        case (.allResolved, .noTargetsRemaining):
+            state = .complete
+            failed()
+
+        // Once we've completed, it's not impossible that we'll get state machine events for
+        // some amounts of work. For example, we could get late DNS results and late connection
+        // notifications, and can also get late scheduled task callbacks. We want to just quietly
+        // ignore these, as our transition into the complete state should have already sent
+        // cleanup messages to all of these things.
+        case (.complete, .resolverACompleted),
+             (.complete, .resolverAAAACompleted),
+             (.complete, .connectSuccess),
+             (.complete, .connectFailed),
+             (.complete, .connectDelayElapsed),
+             (.complete, .connectTimeoutElapsed),
+             (.complete, .resolutionDelayElapsed):
+            break
+        default:
+            fatalError("Invalid FSM transition attempt: state \(state), input \(input)")
+        }
+    }
+
+    /// Fire off a pair of DNS queries.
+    private func beginDNSResolution() {
+        // Per RFC 8305 Section 3, we need to send A and AAAA queries.
+        // The two queries SHOULD be made as soon after one another as possible,
+        // with the AAAA query made first and immediately followed by the A
+        // query.
+        whenAAAALookupComplete(future: resolver.initiateAAAAQuery(host: host, port: port))
+        whenALookupComplete(future: resolver.initiateAQuery(host: host, port: port))
+    }
+
+    /// Called when the A query has completed before the AAAA query.
+    ///
+    /// Happy Eyeballs 2 prefers to connect over IPv6 if it's possible to do so. This means that
+    /// if the A lookup completes first we want to wait a small amount of time before we begin our
+    /// connection attempts, in the hope that the AAAA lookup will complete.
+    ///
+    /// This method sets off a scheduled task for the resolution delay.
+    private func beginResolutionDelay() {
+        resolutionTask = loop.scheduleTask(in: resolutionDelay, resolutionDelayComplete)
+    }
+
+    /// Called when we're ready to start connecting to targets.
+    ///
+    /// This function sets off the first connection attempt, and also sets the connect delay task.
+    private func beginConnecting() {
+        precondition(connectionTask == nil, "beginConnecting called while connection attempts outstanding")
+        guard let target = targets.next() else {
+            if self.pendingConnections.isEmpty {
+                processInput(.noTargetsRemaining)
+            }
+            return
+        }
+
+        connectionTask = loop.scheduleTask(in: connectionDelay) { self.processInput(.connectDelayElapsed) }
+        connectToTarget(target)
+    }
+
+    /// Called when the state machine wants us to connect to new targets, but we may already
+    /// be connecting.
+    ///
+    /// This method takes into account the possibility that we may still be connecting to
+    /// other targets.
+    private func connectToNewTargets() {
+        guard connectionTask == nil else {
+            // Already connecting, no need to do anything here.
+            return
+        }
+
+        // We're not in the middle of connecting, so we can start connecting!
+        beginConnecting()
+    }
+
+    /// Called when the connection delay timer has elapsed.
+    ///
+    /// When the connection delay elapses we are going to initiate another connection
+    /// attempt.
+    private func connectionDelayElapsed() {
+        connectionTask = nil
+        beginConnecting()
+    }
+
+    /// Called when an outstanding connection attempt fails.
+    ///
+    /// This method checks that we don't have any connection attempts outstanding. If
+    /// we discover we don't, it automatically triggers the next connection attempt.
+    private func connectFailed() {
+        if self.pendingConnections.isEmpty {
+            self.connectionTask?.cancel()
+            self.connectionTask = nil
+            beginConnecting()
+        }
+    }
+
+    /// Called when an outstanding connection attempt succeeds.
+    ///
+    /// Cleans up internal state.
+    private func connectSuccess() {
+        cleanUp()
+    }
+
+    /// Called when the overall connection timeout fires.
+    ///
+    /// Cleans up internal state and fails the connection promise.
+    private func timedOut() {
+        cleanUp()
+            self.resolutionPromise.fail(ChannelError.connectTimeout(self.connectTimeout))
+    }
+
+    /// Called when we've attempted to connect to all our resolved targets,
+    /// and were unable to connect to any of them.
+    ///
+    /// Asserts that there is nothing left on the internal state, and then fails the connection
+    /// promise.
+    private func failed() {
+        precondition(pendingConnections.isEmpty, "failed with pending connections")
+        cleanUp()
+        self.resolutionPromise.fail(self.error)
+    }
+
+    /// Called to connect to a given target.
+    ///
+    /// - parameters:
+    ///     - target: The address to connect to.
+    private func connectToTarget(_ target: SocketAddress) {
+        do {
+            let channelFuture = try channelBuilderCallback(self.loop, target.protocol)
+            channelFuture.whenSuccess { asyncChannel in
+                let promise = self.loop.makePromise(of: Channel.self)
+                promise.succeed(asyncChannel.channel)
+                self.pendingConnections.append(promise.futureResult)
+                
+                // If we are in the complete state then we want to abandon this channel. Otherwise, begin
+                // connecting.
+                if case .complete = self.state {
+                    self.pendingConnections.remove(element: promise.futureResult)
+                    asyncChannel.channel.close(promise: nil)
+                } else {
+                    asyncChannel.channel.connect(to: target).map {
+                        // The channel has connected. If we are in the complete state we want to abandon this channel.
+                        // Otherwise, fire the channel connected event. Either way we don't want the channel future to
+                        // be in our list of pending connections, so we don't either double close or close the connection
+                        // we want to use.
+                        self.pendingConnections.remove(element: promise.futureResult)
+                        
+                        if case .complete = self.state {
+                            asyncChannel.channel.close(promise: nil)
+                        } else {
+                            self.processInput(.connectSuccess)
+                            self.resolutionPromise.succeed(asyncChannel)
+                        }
+                    }.whenFailure { err in
+                        // The connection attempt failed. If we're in the complete state then there's nothing
+                        // to do. Otherwise, notify the state machine of the failure.
+                        if case .complete = self.state {
+                            assert(self.pendingConnections.firstIndex { $0 === channelFuture } == nil, "failed but was still in pending connections")
+                        } else {
+                            self.error.connectionErrors.append(SingleConnectionFailure(target: target, error: err))
+                            self.pendingConnections.remove(element: promise.futureResult)
+                            self.processInput(.connectFailed)
+                        }
+                    }
+                }
+                
+                channelFuture.whenFailure { error in
+                    let promise = self.loop.makePromise(of: Channel.self)
+                    self.error.connectionErrors.append(SingleConnectionFailure(target: target, error: error))
+                    self.pendingConnections.remove(element: promise.futureResult)
+                    self.processInput(.connectFailed)
+                }
+            }
+        } catch {
+            resolutionPromise.fail(error)
         }
     }
 

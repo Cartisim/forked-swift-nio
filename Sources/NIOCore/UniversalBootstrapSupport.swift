@@ -114,6 +114,15 @@ public protocol NIOClientTCPBootstrapProtocol {
     ///     - unixDomainSocketPath: The _Unix domain socket_ path to connect to.
     /// - returns: An `EventLoopFuture<Channel>` to deliver the `Channel` when connected.
     func connect(unixDomainSocketPath: String) -> EventLoopFuture<Channel>
+    
+    
+    @available(macOS 10.15, iOS 13, tvOS 13, watchOS 6, *)
+    @_spi(AsyncChannel)
+    func connectAsync<ChildChannelInboundIn: Sendable, ChildChannelOutboundOut: Sendable>(
+        host: String,
+        port: Int,
+        backpressureStrategy: NIOAsyncSequenceProducerBackPressureStrategies.HighLowWatermark?
+    ) async throws -> NIOAsyncChannel<ChildChannelInboundIn, ChildChannelOutboundOut>
 }
 
 /// `NIOClientTCPBootstrap` is a bootstrap that allows you to bootstrap client TCP connections using NIO on BSD Sockets,
@@ -276,6 +285,20 @@ public struct NIOClientTCPBootstrap {
     public func enableTLS() -> NIOClientTCPBootstrap {
         return NIOClientTCPBootstrap(self.tlsEnablerTypeErased(self.underlyingBootstrap),
                                      tlsEnabler: self.tlsEnablerTypeErased)
+    }
+    
+    @available(macOS 10.15, iOS 13, tvOS 13, watchOS 6, *)
+    @_spi(AsyncChannel)
+    public func connectAsync<ChannelInboundIn: Sendable, ChannelOutboundOut: Sendable>(
+        host: String,
+        port: Int,
+        backpressureStrategy: NIOAsyncSequenceProducerBackPressureStrategies.HighLowWatermark? = nil
+    ) async throws -> NIOAsyncChannel<ChannelInboundIn, ChannelOutboundOut> {
+        return try await self.underlyingBootstrap.connectAsync(
+            host: host,
+            port: port,
+            backpressureStrategy: backpressureStrategy
+        )
     }
 }
 

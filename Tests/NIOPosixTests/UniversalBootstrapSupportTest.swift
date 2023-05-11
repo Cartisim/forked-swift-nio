@@ -13,7 +13,7 @@
 //===----------------------------------------------------------------------===//
 
 import XCTest
-import NIOCore
+@_spi(AsyncChannel) import NIOCore
 import NIOEmbedded
 import NIOPosix
 import NIOTestUtils
@@ -139,6 +139,22 @@ class UniversalBootstrapSupportTest: XCTestCase {
     
     func testBootstrapOverrideOfShortcutOptions() {
         final class FakeBootstrap : NIOClientTCPBootstrapProtocol {
+            
+            @available(macOS 10.15, iOS 13, tvOS 13, watchOS 6, *)
+            func connectAsync<ChildChannelInboundIn, ChildChannelOutboundOut>(host: String, port: Int, backpressureStrategy: NIOCore.NIOAsyncSequenceProducerBackPressureStrategies.HighLowWatermark?) async throws -> NIOCore.NIOAsyncChannel<ChildChannelInboundIn, ChildChannelOutboundOut> where ChildChannelInboundIn : Sendable, ChildChannelOutboundOut : Sendable {
+                let channel = NIOAsyncTestingChannel()
+                
+                let wrapped = try await channel.testingEventLoop.executeInContext {
+                    try NIOAsyncChannel(
+                        synchronouslyWrapping: channel,
+                        isOutboundHalfClosureEnabled: true,
+                        inboundType: ChildChannelInboundIn.self,
+                        outboundType: ChildChannelOutboundOut.self
+                    )
+                }
+                return NIOCore.NIOAsyncChannel(channel: channel, inboundStream: wrapped.inboundStream, outboundWriter: wrapped.outboundWriter)
+            }
+            
             func channelInitializer(_ handler: @escaping (Channel) -> EventLoopFuture<Void>) -> Self {
                 fatalError("Not implemented")
             }
@@ -203,6 +219,22 @@ class UniversalBootstrapSupportTest: XCTestCase {
 
 // Prove we've not broken implementors of NIOClientTCPBootstrapProtocol by adding a new method.
 private class UniversalWithoutNewMethods : NIOClientTCPBootstrapProtocol {
+    
+    @available(macOS 10.15, iOS 13, tvOS 13, watchOS 6, *)
+    func connectAsync<ChildChannelInboundIn, ChildChannelOutboundOut>(host: String, port: Int, backpressureStrategy: NIOCore.NIOAsyncSequenceProducerBackPressureStrategies.HighLowWatermark?) async throws -> NIOCore.NIOAsyncChannel<ChildChannelInboundIn, ChildChannelOutboundOut> where ChildChannelInboundIn : Sendable, ChildChannelOutboundOut : Sendable {
+        let channel = NIOAsyncTestingChannel()
+        
+        let wrapped = try await channel.testingEventLoop.executeInContext {
+            try NIOAsyncChannel(
+                synchronouslyWrapping: channel,
+                isOutboundHalfClosureEnabled: true,
+                inboundType: ChildChannelInboundIn.self,
+                outboundType: ChildChannelOutboundOut.self
+            )
+        }
+        return NIOCore.NIOAsyncChannel(channel: channel, inboundStream: wrapped.inboundStream, outboundWriter: wrapped.outboundWriter)
+    }
+    
     func channelInitializer(_ handler: @escaping (Channel) -> EventLoopFuture<Void>) -> Self {
         return self
     }
